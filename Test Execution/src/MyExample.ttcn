@@ -1,0 +1,189 @@
+/*
+Testing steps
+
+Step 1. Testing system sends a) testing inputs (files), and b) deployment plan (xml file) to Repository;
+*deployment plan indicates on which hardware the application components should be executed.
+Step 2. Testing system sends the execution request (JSON message) to Application Manager, and receives the execution id (JSON message) from Application Manager;
+*execution id is a unique identifier to identify one specific execution of an application. 
+Step 3. Testing system subscribes to the execution status by sending a subscription request (JSON message) to Execution Manager;
+Step 4. Testing system waits until receives the notification (JSON message) from Execution Manager, indicating the execution is over;
+Step 5. Testing system retrieves execution outputs (files) from Repository;
+Step 6. Testing system retrieves performance Information (JSON message) from Execution Manager;
+Step 7. Testing system generates testing verdicts based on the real outputs and/or performance information.  
+
+Some JSON example
+
+Request of execution to Application Manager
+
+{
+"user":"aUser",
+"application":"app_1",
+"content":"1", (0 or 1)
+"modifiedAt": "20180410T14h30"
+}
+
+Answer of execution id from Application Manager
+
+{
+" exid":"123"
+}
+
+Notification of execution is over
+
+{
+"user":"aUser",
+"application":"app_1"  
+" exid":"123"
+"content":"\output_folder"
+"startAt": "20180410T14h30"  
+"endAt": "20180410T14h30"
+}
+
+Components to interact with
+    PHANTOM Repository
+    Application Manager
+    Execution Manager
+*/
+module MyExample
+{
+import from TestFunctions all;
+import from TCCFileIO_Functions all;
+import from TCCDateTime_Functions all;
+
+
+modulepar charstring PAR_USERNAME;
+modulepar charstring PAR_PASSWORD;
+
+modulepar charstring PAR_SECURITY_TOKEN;
+
+modulepar charstring PAR_SERVER;
+modulepar integer PAR_REPOSITORY_PORT;
+modulepar integer PAR_EXECUTION_MANAGER_PORT;
+modulepar integer PAR_APPLICATION_MANAGER_PORT;
+
+modulepar integer PAR_GRAFANA_PORT;
+modulepar integer PAR_MONITORING_SERVER_PORT;
+modulepar integer PAR_RESOURCE_MANAGER_PORT;
+
+modulepar charstring PAR_DEPLOYMENTPLAN;
+modulepar charstring PAR_INPUT_DIR;
+
+modulepar charstring PAR_PROJECT;
+modulepar charstring PAR_SOURCE;
+modulepar charstring PAR_INPUT_DIRECTORY_ON_SERVER;
+modulepar charstring PAR_OUTPUT_DIRECTORY_ON_SERVER;
+modulepar charstring PAR_OUTPUT_FILENAME;
+
+modulepar charstring PAR_EXEC_MAN_USER;
+modulepar charstring PAR_EXEC_MAN_APPLICATION;
+modulepar charstring PAR_EXEC_MAN_CONTENT;
+
+
+testcase TC_send() runs on MBT_CT {
+  
+  //var charstring server := PAR_SERVER;//"141.58.0.8";
+  //var integer prt := 2777;
+//  var charstring usrname := "wenbin.li@eglobalmark.com";
+//  var charstring passwd := "8019789746";
+//  var charstring input_dir := "/home/elnrnag/MBT/mbttest/ShipDetection/input/";
+  
+  
+  map(self:HTTPclientPort, system:HTTPclientPort);
+  
+//Step0 : if Security token is not specified then get one
+	var charstring sec_token := PAR_SECURITY_TOKEN;
+	if (lengthof(sec_token) == 0 ) {
+		f_get_security_token(PAR_SERVER, PAR_REPOSITORY_PORT, PAR_USERNAME, PAR_PASSWORD, sec_token);
+	}
+  
+//Step 1. Testing system sends a) testing inputs (files), and b) deployment plan (xml file) to Repository;
+
+
+  	var charstring metadata := "{\"project\": \"MBT\",  \"source\": \"user\", \"type\":\"InputImage\", \"name\":\"HPC\",  \"content\":\"img_file\"}";
+    
+    var FileList fileList;
+    
+    if (f_FIO_fileList(PAR_INPUT_DIR, fileList)) {
+      log(fileList);
+      
+      for (var integer i := 0; i < lengthof(fileList); i:=i+1) {
+        if((fileList[i] != "..") and (fileList[i] != ".")){
+          //if ((substr(fileList[i],0,4) == "1_sd") or (fileList[i] == PAR_DEPLOYMENTPLAN)) {
+            log ("Uploading " & fileList[i] &" ...");
+        	  if(f_upload_file_to_repository(PAR_SERVER, PAR_REPOSITORY_PORT, sec_token, PAR_INPUT_DIR, fileList[i], metadata, "MBT")) {
+        	  	log ("Successfully uploaded " & fileList[i]);
+        	    setverdict(pass);
+	       	  } else {
+    		    log ("Failed to upload " & fileList[i] & "!");
+    		    setverdict(fail);
+    	  	  }
+          //}
+      	}
+      }
+    }
+
+//Step 2. Testing system sends the execution request (JSON message) to Application Manager, and receives the execution id (JSON message) from Application Manager;
+  
+    var charstring executionID := "";
+    //20180410T14h30
+    var charstring modifiedAt := f_getTimeFormatted(f_time(), "%Y%m%dT%Hh%M");
+    
+    log("ModifiedAt: ", modifiedAt);
+    
+    
+    if (f_send_execution_request_to_appl_manager(PAR_SERVER, 
+    											 PAR_APPLICATION_MANAGER_PORT, 
+    											 sec_token, 
+    											 PAR_EXEC_MAN_USER,
+    											 PAR_EXEC_MAN_APPLICATION,
+    											 PAR_EXEC_MAN_CONTENT,
+    											 modifiedAt, 
+    											 executionID)) {
+		log("ExecuitonID received: ", executionID);
+    }
+
+    
+// Step 3. Testing system subscribes to the execution status by sending a subscription request (JSON message) to Execution Manager;
+	if (f_send_subscription_request_to_exec_manager(PAR_SERVER, 
+    										 		PAR_APPLICATION_MANAGER_PORT, 
+    										 		sec_token,   											 
+												    executionID)) {
+		log("Subscription to Execution status successful")	
+		setverdict(pass);											      
+	} else {
+    	    setverdict ( fail, "Filed to subscribe to ExecutionID" );
+	}
+
+// Step 4. Testing system waits until receives the notification (JSON message) from Execution Manager, indicating the execution is over;
+    
+    
+    
+//Step 5. Testing system retrieves execution outputs (files) from Repository;
+    if (f_download_file_from_repository(PAR_SERVER, 
+	    								PAR_REPOSITORY_PORT, 
+    									sec_token, 
+    									PAR_PROJECT, 
+    									PAR_SOURCE, 
+    									PAR_OUTPUT_DIRECTORY_ON_SERVER, 
+    									PAR_OUTPUT_FILENAME)) 
+    {
+      setverdict(pass);								  
+    } else {
+      setverdict(fail);
+    }
+    
+//Step 7. Testing system generates testing verdicts based on the real outputs and/or performance information.  
+    
+	
+  unmap(self:HTTPclientPort, system:HTTPclientPort);
+  
+}
+
+
+
+control
+{
+
+  execute(TC_send());
+}
+}

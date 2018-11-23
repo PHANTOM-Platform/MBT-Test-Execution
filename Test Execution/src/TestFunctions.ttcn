@@ -1,0 +1,1234 @@
+module TestFunctions{
+import from HTTPmsg_PortType all;
+import from HTTPmsg_Types all;
+
+import from IPL4asp_PortType all;
+import from IPL4asp_Types all;
+
+import from HTTPmsg_MessageLen all;
+
+import from TCCFileIO_Functions all;
+import from TCCEncoding_Functions all;
+
+import from WebSocket_Types all;
+
+
+// generates 16 octet random data
+function gen_boundary_str() return charstring{
+  var integer i:=0
+  var charstring ret_val:=""
+  for(i:=0;i<16;i:=i+1){
+    ret_val:=ret_val & oct2str(int2oct(float2int(rnd()*255.0),1))
+  }
+  return ret_val
+}
+
+// converts an integer to octetstring
+// First converts the integer to charstring hex digits 
+// the to octetstring
+function int2hex2oct(in integer val) return octetstring {
+  var octetstring ret_val:=''O
+  
+  while(val>0){
+    ret_val:= char2oct(hex2str(int2hex(val rem 16,1))) & ret_val
+    
+    val:= val / 16
+  }
+  
+  return ret_val
+}
+
+// Warpper function for message dissector for HTTP
+// This function is registered in IPL4 test port in order to 
+// find the message boundaries in the incoming stream.
+function f_HTTP_msglength(in octetstring stream, inout ro_integer args) return integer {
+  return f_HTTPMessage_len(stream)
+}
+
+
+function f_ws_msglength(in octetstring stream, inout ro_integer args) return integer {
+  return f_WebSocket_calc_length(stream)
+}
+
+/*****************************
+  Holds the data needed to 
+  connect to the SUT
+  
+  The host names can be either IPv4 or IPv6 literals or DNS names
+  
+*****************************/
+type record t_SUT_descriptor{
+    charstring    repository_hostname,
+    integer       repository_port,
+    charstring    appl_manager_hostname,
+    integer       appl_manager_port,
+    charstring    exec_manager_hostname,
+    integer       exec_manager_port,
+    charstring    auth_token optional  // The authentication token used to auhtneticate ourself
+/*
+    // authentication parameters, used to get the auth token
+    // currently just a placeholder
+    charstring    auth_hostname optional,
+    integer       auth_port optional,
+    charstring    user_name optional,
+    charstring    user_passwd optional
+*/    
+
+}
+
+
+type component MBT_CT{
+  var t_SUT_descriptor         sut_data;
+  
+  port IPL4asp_PT          HTTPclientPort;  // used to send requests
+  port IPL4asp_PT          HTTPserverPort;  // receive notifications from execution manager
+  
+
+}
+
+/**********************************
+Opens a connection to the host
+
+Handles the ERROR_TEMPORARILY_UNAVAILABLE
+
+return value:
+  - true : connection is ready
+  - false: connection can't be established
+
+**********************************/
+
+function f_open_connection (
+  inout IPL4asp_PT  ipl4_port,
+  in charstring   host_name,
+  in integer      host_port,
+  in float        transaction_timeout,
+  out ConnectionId  connid
+) return boolean {
+
+  var Result result;
+  var ASP_Event event
+  
+  timer T_timeout
+
+  // Try to connect to the remote host
+  result:=f_IPL4_connect(
+    ipl4_port,
+    host_name,
+    host_port,
+    "",  // Local host name, selected automatically
+    0,   // local port, selected automatically
+    -1,
+    {tcp:={}}
+  );
+  
+  // If ther is no connId returned, the connection failed.
+  if(not ispresent(result.connId)){
+    // Something went wrong
+    log("Connection failed: ", result)
+    return false;
+  }
+  
+  connid:=result.connId
+  
+  // The ERROR_TEMPORARILY_UNAVAILABLE means, the connection is in progress
+  // We should wait for the connection completion, signaled by the ERROR_AVAILABLE
+  if(ispresent(result.errorCode) and result.errorCode == ERROR_TEMPORARILY_UNAVAILABLE){
+    // Connection in progress
+    if(transaction_timeout>0.0){
+      T_timeout.start(transaction_timeout)
+    }
+    alt{
+      [] ipl4_port.receive(ASP_Event:{result:={
+                                             errorCode:=ERROR_AVAILABLE,
+                                             connId:=connid,
+                                             os_error_code:=*,
+                                             os_error_text:=*
+                                             }}) {
+                                             // Connection established
+                                                if(T_timeout.running){
+                                                  T_timeout.stop
+                                                }
+                                             
+                                             }
+       [] ipl4_port.receive(ASP_Event:{result:=?}) -> value event {
+          // Connection failed
+          log("Connection failed: ", event)
+          if(T_timeout.running){
+            T_timeout.stop
+          }
+          // wait for close event
+          repeat;
+        }
+        [] ipl4_port.receive(ASP_Event:{connClosed:=?}) -> value event {
+          // Connection failed
+          log("Connection closed: ", event)
+          if(T_timeout.running){
+            T_timeout.stop
+          }
+          return false;
+        }
+        [transaction_timeout>0.0] T_timeout.timeout {
+          // Connection timeout
+          f_IPL4_close(ipl4_port,connid)
+          log("Connection timeout")
+          return false;
+        }
+      
+    }
+  }
+  
+  // register the msg length function
+  var f_getMsgLen f_func:= refers(f_HTTP_msglength)
+  f_IPL4_setGetMsgLen(ipl4_port,connid,f_func,{})
+
+  return true;
+}
+
+/****************************************
+
+Sends one octetstring.
+
+Handles connection errors & blocking
+return value:
+  - true : message was sent
+  - false: something went wrong, connection was closed
+
+****************************************/
+function f_send_msg(
+  inout IPL4asp_PT  ipl4_port,
+  in ConnectionId  connid,
+  in octetstring   msg
+) return boolean {
+  var Result result;
+  var integer sent_octets;
+  
+  // We try to send all of the octets
+  // It is possible that not all octets can be sent at once
+  while(lengthof(msg)>0){
+    // try to send
+    result:=f_IPL4_send(ipl4_port,{connid,omit,msg},sent_octets);
+    if(ispresent(result.errorCode)){
+      // Either send error ot ERROR_TEMPORARILY_UNAVAILABLE
+      // wait for either the close event or the available event
+      // In the case of the error indication, the connClosed event will arrive soon.
+      // If the connection just blocked, we're waiting for ERROR_AVAILABLE
+      alt{
+        [] ipl4_port.receive(ASP_Event:{result:={
+                                             errorCode:=ERROR_AVAILABLE,
+                                             connId:=connid,
+                                             os_error_code:=*,
+                                             os_error_text:=*
+                                             }}) {
+                                               // We can send again
+                                               // just strip out the already sent octets
+                                               msg:=substr(msg,sent_octets,lengthof(msg)-sent_octets)
+                                             }
+        [] ipl4_port.receive(ASP_Event:{connClosed:=?}){
+             return false;
+           }
+      }
+    } else {
+      // everything was sent
+      // no errorCode -> every octets was sent.
+      return true;
+    }
+  }
+  return true;
+}
+
+/*****************************
+  Initializes the WebSocket connection
+  
+  1. Opens a connection to the specified host
+  2. Send the HTTP request to open websocket
+  3. Waits for the ansver
+  4. If 101 received, replace the message lenght function
+
+  
+  Return value:
+    true  - Websocket opened
+    false - Tranposrt error or timeout
+    
+    ws_connid - the connid of the websocket connection
+
+*****************************/
+function f_ws_open(
+  in charstring   host_name,
+  in integer      host_port,
+  out ConnectionId ws_connid,
+  in float        transaction_timeout  // if >0 specifies the timeout of the whole operation.
+)  runs on MBT_CT return boolean{
+  var Result result;
+  timer T_timeout
+  var ConnectionId connid
+  var ASP_RecvFrom msg
+/*
+        |Sec-WebSocket-Key|.  The value of this header field MUST be a
+        nonce consisting of a randomly selected 16-byte value that has
+        been base64-encoded (see Section 4 of [RFC4648]).  The nonce
+        MUST be selected randomly for each connection.
+
+*/
+  var charstring v_ws_key:=enc_LDIF_Base64(
+    int2oct(float2int(256.0*rnd()),2)& int2oct(float2int(256.0*rnd()),2)&  int2oct(float2int(256.0*rnd()),2)& int2oct(float2int(256.0*rnd()),2)&
+    int2oct(float2int(256.0*rnd()),2)& int2oct(float2int(256.0*rnd()),2)&  int2oct(float2int(256.0*rnd()),2)& int2oct(float2int(256.0*rnd()),2)&
+    int2oct(float2int(256.0*rnd()),2)& int2oct(float2int(256.0*rnd()),2)&  int2oct(float2int(256.0*rnd()),2)& int2oct(float2int(256.0*rnd()),2)&
+    int2oct(float2int(256.0*rnd()),2)& int2oct(float2int(256.0*rnd()),2)&  int2oct(float2int(256.0*rnd()),2)& int2oct(float2int(256.0*rnd()),2)
+  )
+  var octetstring oct_request
+  var octetstring oct_response
+  
+  ws_connid:=-1
+  
+  if( not f_open_connection(HTTPclientPort,host_name,host_port,transaction_timeout,connid)){
+    return false;
+  }
+  var HTTPMessage  http_request:={
+    request:={
+      client_id:=omit,
+      method:="GET",
+      uri:="/",
+      version_major:=1,
+      version_minor:=1,
+      header:={
+        {header_name:="Host",header_value:=host_name &":" & int2str(host_port)},
+        {header_name:="Upgrade",header_value:="websocket"},
+        {header_name:="Connection",header_value:="upgrade"},
+        {header_name:="Sec-WebSocket-Key",header_value:=v_ws_key},
+        {header_name:="Sec-WebSocket-Version",header_value:="13"}      },
+      body:=""
+    }
+  }
+  var HTTPMessage http_response
+  oct_request:=enc_HTTPMessage(http_request)
+  
+  if(not f_send_msg(HTTPclientPort,connid,oct_request)){
+    // the connection is already closed
+    return false;
+  }  
+  alt{
+    [] HTTPclientPort.receive(ASP_RecvFrom:?) -> value msg{  // We always receive the whole message 
+                                                          // because of the registered msg length function
+      if(dec_HTTPMessage(msg.msg,http_response)!=0){ 
+        // decoding failed
+        f_IPL4_close(HTTPclientPort,connid)
+        log("HTTP message decoding failed: ", msg)
+       
+        return false;
+      }
+    }
+    [] HTTPclientPort.receive(ASP_Event:{connClosed:=?}){
+      log("Connection was closed by remote side")
+        return false;
+    }
+    [] HTTPclientPort.receive {
+      // Any error indication is followed by the connClosed event
+      repeat;
+    }
+  }
+  
+  if((ischosen(http_response.response) and http_response.response.statuscode==101 ) or (ischosen(http_response.response_binary) and http_response.response_binary.statuscode==101 )){
+    // websocket connection completed
+    ws_connid:=connid
+    
+  } else {
+        f_IPL4_close(HTTPclientPort,connid)
+        log("Websocket connect failed: ", http_response)
+       
+        return false;
+    
+  }
+
+  var f_getMsgLen f_func:= refers(f_ws_msglength)
+  f_IPL4_setGetMsgLen(HTTPclientPort,connid,f_func,{})
+ 
+  
+  return true
+}
+
+/*****************************
+  Sends WebSocket message
+  
+  Used to subscribe to the execution
+  
+  Return value:
+    true  - Message sent
+    false - Tranposrt error or timeout
+    
+
+*****************************/
+function f_ws_send(
+  in ConnectionId ws_connid,
+  in octetstring msg_to_send,
+  in float        transaction_timeout  // if >0 specifies the timeout of the whole operation.
+)  runs on MBT_CT return boolean{
+
+  var WebSocket_PDU ws_pdu:={
+    fin_bit :='1'B,
+    rsv1_bit:='0'B,
+    rsv2_bit:='0'B,
+    rsv3_bit:='0'B,
+    opcode:=Text_frame,
+    mask_bit:='1'B,
+    payload_len:=0,
+    masking_key:=omit,
+    payload_data:={data:=msg_to_send}
+  }
+  
+  var octetstring encoded_msg
+  f_WebSocket_Encode(ws_pdu,encoded_msg)
+
+  if(not f_send_msg(HTTPclientPort,ws_connid,encoded_msg)){
+    // the connection is already closed
+    return false;
+  }
+  
+  return true;
+}
+
+/*****************************
+  Executes one HTTP querry
+  
+  1. Opens a connection to the specified host
+  2. Send the HTTP request 
+  3. Waits for the ansver
+  4. Store the response in the parameter
+  5. Close the connection
+  
+  Return value:
+    true  - Valid HTTP response is received
+    false - Tranposrt error or timeout
+
+*****************************/
+
+function f_execute_HTTP_querry(
+  in charstring   host_name,
+  in integer      host_port,
+  in HTTPMessage  http_request,
+  out HTTPMessage http_response,
+  in float        transaction_timeout  // if >0 specifies the timeout of the whole operation.
+  
+) runs on MBT_CT return boolean{
+
+  var Result result;
+  timer T_timeout
+  var ConnectionId connid
+  var ASP_RecvFrom msg
+  
+  var octetstring oct_request
+  var octetstring oct_response
+  
+  //  Connect to the server
+  if( not f_open_connection(HTTPclientPort,host_name,host_port,transaction_timeout,connid)){
+    return false;
+  }
+
+  // Connection established, lets send the message
+  
+  oct_request:=enc_HTTPMessage(http_request)
+  
+  if(not f_send_msg(HTTPclientPort,connid,oct_request)){
+    // the connection is already closed
+    return false;
+  }
+  
+  // wait for result
+  
+  alt{
+    [] HTTPclientPort.receive(ASP_RecvFrom:?) -> value msg{  // We always receive the whole message 
+                                                          // because of the registered msg length function
+      if(dec_HTTPMessage(msg.msg,http_response)!=0){ 
+        // decoding failed
+        f_IPL4_close(HTTPclientPort,connid)
+        log("HTTP message decoding failed: ", msg)
+       
+        return false;
+      }
+    }
+    [] HTTPclientPort.receive(ASP_Event:{connClosed:=?}){
+      log("Connection was closed by remote side")
+        return false;
+    }
+    [] HTTPclientPort.receive {
+      // Any error indication is followed by the connClosed event
+      repeat;
+    }
+  }
+  
+  // Now we can close the connection
+  f_IPL4_close(HTTPclientPort,connid)
+  
+  // Just empty the port queue if the remote side closed the connection meanwhile
+  HTTPclientPort.clear  
+  
+  return true;
+}
+
+/*****************************
+  Executes one HTTP querry
+  
+  The body of http_request are read from the file, using chunked encoding whith a specified chunk size
+  
+  1. Opens a connection to the specified host
+  2. Send the HTTP request
+  3. Waits for the ansver
+  4. Store the response in the parameter
+  5. Close the connection
+
+  In the case of chunked body, 
+    - the Transfer-Encoding header field is added
+    - The Content-Length header should not present
+
+  In the case of non chunked body, 
+    - the Transfer-Encoding header field should not present
+    - The Content-Length header is added
+
+  Return value:
+    true  - Valid HTTP response is received
+    false - Tranposrt error or timeout
+
+    
+  additional_data: if present the content os if send alongside the file using MIME multipart/form media type
+*****************************/
+
+function f_execute_HTTP_querry_body_from_file(
+  in charstring   host_name,
+  in integer      host_port,
+  in HTTPMessage  http_request,
+  out HTTPMessage http_response,
+  in float        transaction_timeout,  // if >0 specifies the timeout of the whole operation.
+  in charstring   body_filename,
+  in integer      chunksize,  // if >0 Chunked body, The specifies the chunk size
+                             // if <0 Not chunked body, The content-length header is set
+  in octetstring  additional_data:=''O
+) runs on MBT_CT return boolean{
+  chunksize:=0 // the additional_data & chunked is not ready yet.
+  // Get the size of the file, it also checks for the existence of it
+  var integer v_fsize:=f_FIO_fileSize(body_filename)
+  if(v_fsize<0){
+    // can't get the size of the file
+    log("Can't get the size of the file: ", body_filename, f_FIO_get_error_string())
+    return false
+  }
+  
+  // open the file for reading
+  var integer v_fd:=f_FIO_open_rdonly(body_filename)
+  if(v_fd<0){
+    // can't open the file
+    log("Can't open the file: ", body_filename, f_FIO_get_error_string())
+    return false
+  }
+  
+  var charstring v_boundary:=""
+  var octetstring v_fileheader:=''O
+  var octetstring v_dataheader:=''O
+  var octetstring v_postamble:=''O
+  if(lengthof(additional_data)>0){
+    v_boundary:= "------------------------" & gen_boundary_str()
+    if(ischosen(http_request.request)){
+      http_request.request.header[lengthof(http_request.request.header)]:={header_name:="Content-Type",header_value:="multipart/form-data; boundary=" & v_boundary}
+    } else if(ischosen(http_request.request_binary)) {
+      http_request.request_binary.header[lengthof(http_request.request.header)]:={header_name:="Content-Type",header_value:="multipart/form-data; boundary=" & v_boundary}
+    } else {
+      // We messed up something
+      log("Internal error, not a request: ", http_request)
+      f_FIO_close(v_fd)
+    }
+    v_fileheader:=char2oct("--" & v_boundary & "\r\n" &
+                           "Content-Disposition: form-data; name=""UploadFile""; filename=""" & body_filename  & """\r\n" &
+                           "Content-Type: application/octet-stream\r\n" &
+                           "\r\n")
+    v_dataheader:=char2oct("\r\n--" & v_boundary&"\r\n" &
+                           "Content-Disposition: form-data; name=""UploadJSON""\r\n" &
+                           "Content-Type: application/octet-stream\r\n" &
+                           "\r\n")
+    
+    v_postamble:=char2oct("\r\n--" & v_boundary & "--\r\n")
+  }
+  
+  // Set the appripriate HTTP header
+  if(chunksize>0){
+    // Use chunked encoding, set the Transfer-Encoding header
+    if(ischosen(http_request.request)){
+      http_request.request.header[lengthof(http_request.request.header)]:={header_name:="Transfer-Encoding",header_value:="chunked"}
+    } else if(ischosen(http_request.request_binary)) {
+      http_request.request_binary.header[lengthof(http_request.request.header)]:={header_name:="Transfer-Encoding",header_value:="chunked"}
+    } else {
+      // We messed up something
+      log("Internal error, not a request: ", http_request)
+      f_FIO_close(v_fd)
+    }
+  } else {
+    // Use non-chunked encoding, set the Content-Length header
+    if(ischosen(http_request.request)){
+      http_request.request.header[lengthof(http_request.request.header)]:={header_name:="Content-Length",header_value:=int2str(v_fsize+lengthof(v_fileheader)+lengthof(v_dataheader)+lengthof(v_postamble)+lengthof(additional_data))}
+      http_request.request.header[lengthof(http_request.request.header)]:={header_name:="Expect",header_value:="100-Continue"}
+    } else if(ischosen(http_request.request_binary)) {
+      http_request.request_binary.header[lengthof(http_request.request.header)]:={header_name:="Content-Length",header_value:=int2str(v_fsize+lengthof(v_fileheader)+lengthof(v_dataheader)+lengthof(v_postamble)+lengthof(additional_data))}
+      http_request.request_binary.header[lengthof(http_request.request.header)]:={header_name:="Expect",header_value:="100-Continue"}
+    } else {
+      // We messed up something
+      log("Internal error, not a request: ", http_request)
+      f_FIO_close(v_fd)
+      return false
+    }
+  }
+  
+  // We're ready to send
+  var Result result;
+  timer T_timeout
+  var ConnectionId connid
+  var ASP_RecvFrom msg
+  
+  var octetstring oct_request
+  var octetstring oct_response
+  
+  //  Connect to the server
+  if( not f_open_connection(HTTPclientPort,host_name,host_port,transaction_timeout,connid)){
+    return false;
+  }
+
+  // Connection established, lets send the message
+  
+  oct_request:=enc_HTTPMessage(http_request)
+  
+  if(not f_send_msg(HTTPclientPort,connid,oct_request)){
+    // the connection is already closed
+    f_FIO_close(v_fd)
+    return false;
+  }
+  // The header was sent waits for 100 Continue
+  alt{
+    [] HTTPclientPort.receive(ASP_RecvFrom:?) -> value msg{  // We always receive the whole message 
+                                                          // because of the registered msg length function
+      if(dec_HTTPMessage(msg.msg,http_response)!=0){ 
+        // decoding failed
+        f_IPL4_close(HTTPclientPort,connid)
+        log("HTTP message decoding failed: ", msg)
+        f_FIO_close(v_fd)
+        return false;
+      }
+      if( not ((ischosen(http_response.response) and (http_response.response.statuscode == 100)) or 
+         (ischosen(http_response.response_binary) and (http_response.response_binary.statuscode == 100)))
+      ){
+        log("The received message is not 100 Continue: ",http_response)
+        f_FIO_close(v_fd)
+        return false;
+      }
+    }
+    [] HTTPclientPort.receive(ASP_Event:{connClosed:=?}){
+      log("Connection was closed by remote side")
+        f_FIO_close(v_fd)
+        return false;
+    }
+    [] HTTPclientPort.receive {
+      // Any error indication is followed by the connClosed event
+      repeat;
+    }
+  }
+ 
+  
+  // The header was sent, lets send the file
+  if(chunksize>0){
+    while(v_fsize>0){
+      var octetstring v_fdata;
+      var integer v_readsize:=f_FIO_read_data(v_fd,v_fdata,v_fsize)
+      if( v_readsize<0){
+        // read failed
+        log("Reading from file failed: " ,f_FIO_get_error_string() )
+        f_FIO_close(v_fd)
+        f_IPL4_close(HTTPclientPort,connid)
+      }
+      if(not f_send_msg(HTTPclientPort,connid,int2hex2oct(v_readsize) & '0D0A'O & v_fdata & '0D0A'O)){ 
+        // the connection is already closed
+        f_FIO_close(v_fd)
+        return false;
+      }
+
+      v_fsize:=v_fsize-v_readsize
+    }
+    
+    // send the final chunk
+     if(not f_send_msg(HTTPclientPort,connid,'300D0A0D0A'O)){  // The final chunk: 0CRLFCRLF
+      // the connection is already closed
+      f_FIO_close(v_fd)
+      return false;
+    }
+   
+  } else {
+    // send the whole file at once
+    var octetstring v_fdata;
+    if( f_FIO_read_data(v_fd,v_fdata,v_fsize)<0){
+      // read failed
+      log("Reading from file failed: " ,f_FIO_get_error_string() )
+      f_FIO_close(v_fd)
+      f_IPL4_close(HTTPclientPort,connid)
+    }
+  
+    if(not f_send_msg(HTTPclientPort,connid,v_fileheader&v_fdata)){
+      // the connection is already closed
+      f_FIO_close(v_fd)
+      return false;
+    }
+    if(lengthof(additional_data)>0){
+      if(not f_send_msg(HTTPclientPort,connid,v_dataheader&additional_data&v_postamble)){
+        // the connection is already closed
+        f_FIO_close(v_fd)
+        return false;
+      }
+    }
+    
+  }
+  // wait for result
+  
+  alt{
+    [] HTTPclientPort.receive(ASP_RecvFrom:?) -> value msg{  // We always receive the whole message 
+                                                          // because of the registered msg length function
+      if(dec_HTTPMessage(msg.msg,http_response)!=0){ 
+        // decoding failed
+        f_IPL4_close(HTTPclientPort,connid)
+        log("HTTP message decoding failed: ", msg)
+       
+        return false;
+      }
+    }
+    [] HTTPclientPort.receive(ASP_Event:{connClosed:=?}){
+      log("Connection was closed by remote side")
+        return false;
+    }
+    [] HTTPclientPort.receive {
+      // Any error indication is followed by the connClosed event
+      repeat;
+    }
+  }
+  
+  // Now we can close the connection
+  f_IPL4_close(HTTPclientPort,connid)
+  
+  // Just empty the port queue if the remote side closed the connection meanwhile
+  HTTPclientPort.clear  
+  
+  return true;
+  
+}
+
+
+/*****************************
+  Executes one HTTP querry
+  
+  The body of http_reqspone, if any, are stored in the file.
+  
+  1. Opens a connection to the specified host
+  2. Send the HTTP request
+  3. Waits for the ansver
+  4. Store the response in the parameter
+  5. Close the connection
+  
+  Return value:
+    true  - Valid HTTP response is received
+    false - Tranposrt error or timeout
+
+*****************************/
+
+
+function f_execute_HTTP_querry_body_to_file(
+  in charstring   host_name,
+  in integer      host_port,
+  in HTTPMessage  http_request,
+  out HTTPMessage http_response,
+  in float        transaction_timeout,  // if >0 specifies the timeout of the whole operation.
+  in charstring   body_filename
+  
+) runs on MBT_CT return boolean{
+  if(f_execute_HTTP_querry(host_name,host_port,http_request,http_response,transaction_timeout)){
+    // Not to optimal in the case of large body, but works. Need some memory
+    // So save the body part
+    
+    var integer v_fd:=f_FIO_open_append_wronly(body_filename)
+    if(v_fd<0){
+      // Can't open the file
+      log("Can't open the file: ", body_filename, f_FIO_get_error_string())
+      return false
+    }
+    
+    var integer v_write_res:=-1
+    if(ischosen(http_response.response)){
+      v_write_res:=f_FIO_write_text(v_fd,http_response.response.body)
+      http_response.response.body:=""
+    } else if(ischosen(http_response.response_binary)) {
+      v_write_res:=f_FIO_write_data(v_fd,http_response.response_binary.body)
+      http_response.response_binary.body:=''O
+    } else {
+      // What the *** we've received
+      log("Unexpected message type received: ", http_response)
+    }
+    if(v_write_res<0){
+      // Can't open the file
+      log("Can't write to the file: ", body_filename, f_FIO_get_error_string())
+      f_FIO_close(v_fd)
+      return false
+    }
+    f_FIO_close(v_fd)
+    return true
+   
+    
+  }
+  return false
+}
+
+function getCommonHeaderLines(in charstring hname, in integer hport, in charstring security_token) runs on MBT_CT return HeaderLines {
+  	var HeaderLine hl_host := {header_name := "Host",
+        							      header_value := hname & ":" & int2str(hport)};
+    var HeaderLine hl_useragent := {header_name := "User-Agent",
+        							      header_value := "TITAN"};
+        							      
+    var HeaderLine hl_accept := {header_name := "Accept",
+      							      header_value := "*/*"};
+    var HeaderLine hl_authorization := {header_name := "Authorization",
+        							      header_value := "OAuth " & security_token};
+
+	var HeaderLines header := { hl_host, hl_useragent, hl_accept, hl_authorization};
+	
+	return header;	  
+  	
+}
+
+
+/*****************************
+
+  Function for each operation
+  
+  Each function:
+     - Set the HTTP request parameters
+     - Generates the body
+     - Executes the HTTP querry
+     - Checks the response
+  
+  Input data:
+     - parameters
+     - component variables
+     
+  Output data:
+     - parameters
+     - component variables
+  
+   return value:
+      - true  - 200 OK received
+      - false - Something went wrong
+*****************************/
+function f_check_connectivity(in charstring hname, in integer hport) runs on MBT_CT return boolean { 
+  var ConnectionId  connid;
+  
+  var boolean to_return := false;
+  
+  if (f_open_connection (HTTPclientPort, hname, hport, 4.0, connid)) {
+    setverdict(pass);
+	  var HeaderLines header := {}
+	  
+	  var HTTPMessage http_request := { request := {
+	      client_id := omit,
+		  method := "GET",
+		  uri := "/",
+		  version_major := 1,
+		  version_minor := 1,
+		  header := header,
+		  body := ""
+	  }}
+	  
+	  var HTTPMessage http_response;
+	  if (f_execute_HTTP_querry(hname, hport, http_request, http_response, 4.0)) {
+	    setverdict(pass);
+	    
+	    var template HTTPMessage http_response_template := {response := {
+	      client_id := *,
+	      version_major := 1,
+		  version_minor := 1,
+		  statuscode := 200,
+		  statustext := "OK",
+		  header := ?,
+		  body := ?
+	    }}
+	    
+	    if (match(http_response, http_response_template)) {
+	      setverdict(pass);
+	      to_return := true;
+	    } else {
+	      
+	      log(http_response);
+		  setverdict(fail);
+	      to_return := false;
+				      
+	    }
+	    
+	    
+	  } else {
+	    setverdict(fail);
+	    to_return := false;
+	  }
+	} else {
+	  setverdict(fail);
+	  to_return := false;
+	}
+		
+	return to_return;
+}
+
+
+function f_get_security_token(in charstring hname, in integer hport, in charstring emailaddr, in charstring password, out charstring security_token) runs on MBT_CT return boolean {
+	var ConnectionId  connid;
+  	var boolean to_return := false;
+  
+  
+  	if (f_open_connection (HTTPclientPort, hname, hport, 4.0, connid)) {
+    setverdict(pass);
+      //var HeaderLine hl_
+	  var HeaderLines header := {
+	    
+	  }
+	  
+	  var charstring URI := "/login?email="&emailaddr&"&pw="&password;
+	  
+	  var HTTPMessage http_request := { request := {
+	      client_id := omit,
+		  method := "GET",
+		  uri := URI,
+		  version_major := 1,
+		  version_minor := 1,
+		  header := header,
+		  body := ""
+	  }}
+	  
+	  var HTTPMessage http_response;
+	  if (f_execute_HTTP_querry(hname, hport, http_request, http_response, 4.0)) {
+	       setverdict(pass);
+	       
+	    var template HTTPMessage http_response_template := {response := {
+	      client_id := *,
+	      version_major := 1,
+		  version_minor := 1,
+		  statuscode := 200,
+		  statustext := "OK",
+		  header := ?,
+		  body := ?
+	    }}
+	    
+	    if (match(http_response, http_response_template)) {
+	       
+			log("ELNRNAG HTTPResponse =============")		       
+			log(http_response);
+  			log("ELNRNAG HTTPResponse =============")
+	        setverdict(pass);
+    	    security_token := http_response.response.body;
+	        to_return := true;
+	    } else {
+	      security_token := "";
+	      to_return := false;
+	    }
+	  }
+	}
+	return to_return;
+}
+
+function f_upload_file_to_repository(in charstring hname, 
+									 in integer hport, 
+									 in charstring security_token, 
+									 in charstring input_directory,
+									 in charstring filename, 
+									 in charstring metadata, 
+									 in charstring destination_dir) runs on MBT_CT return boolean{
+    
+  	var ConnectionId  connid;
+  	var boolean to_return := false;
+  
+  
+  	if (f_open_connection (HTTPclientPort, hname, hport, 4.0, connid)) {
+    setverdict(pass);
+      
+	  var charstring URI := "/upload?DestFileName="&filename&"&Path="&destination_dir&"/";
+	  
+	  var HeaderLines header := getCommonHeaderLines(hname, hport, security_token);
+	  
+	  var HTTPMessage http_request := { request := {
+	      client_id := omit,
+		  method := "POST",
+		  uri := URI,
+		  version_major := 1,
+		  version_minor := 1,
+		  header := header,
+		  body := ""
+	  }}
+	  
+	  var HTTPMessage http_response;
+	  var charstring inputfile := input_directory&filename;
+	  
+	  if (	  f_execute_HTTP_querry_body_from_file(hname, hport, http_request, http_response, 4.0, inputfile, 0, char2oct(metadata))) {
+	       setverdict(pass);
+	       
+	    var template HTTPMessage http_response_template := {response := {
+	      client_id := *,
+	      version_major := 1,
+		  version_minor := 1,
+		  statuscode := 200,
+		  statustext := "OK",
+		  header := ?,
+		  body := ?
+	    }}
+
+	    if (match(http_response, http_response_template)) {
+	       
+			log("ELNRNAG HTTPResponse =============")		       
+			log(http_response);
+  			log("ELNRNAG HTTPResponse =============")
+	        setverdict(pass);
+    	    security_token := http_response.response.body;
+	        to_return := true;
+	    } else {
+	      security_token := "";
+	      to_return := false;
+	    }
+	  }
+	}
+	return to_return;
+}
+
+function f_send_deplyment_plan_to_repository(
+) runs on MBT_CT return boolean{
+  return false
+}
+
+function f_send_execution_request_to_appl_manager(in charstring hname, 
+									 			  in integer hport, 
+									              in charstring security_token,
+									              in charstring user,
+									              in charstring application,
+									              in charstring content,
+									              in charstring modifiedAt,
+									              out charstring executionId)	runs on MBT_CT return boolean{
+  
+  	var charstring ExecutionRequestJSON := "{\"user\":\" "& user &"\",\"application\":\"" & application & "\",\"content\":\"" & content & "\",\"modifiedAt\": \" "& modifiedAt & "\"}";
+  
+  	var ConnectionId  connid;
+  	var boolean to_return := false;
+  
+  
+  	if (f_open_connection (HTTPclientPort, hname, hport, 4.0, connid)) {
+    setverdict(pass);
+      //var HeaderLine hl_
+	  var HeaderLines header := getCommonHeaderLines(hname, hport, security_token);
+	  
+	  //var charstring URI := "/login?email="&emailaddr&"&pw="&password;
+	  
+	  var HTTPMessage http_request := { request := {
+	      client_id := omit,
+		  method := "GET",
+		  uri := "/", //May need an URI
+		  version_major := 1,
+		  version_minor := 1,
+		  header := header,
+		  body := ExecutionRequestJSON
+	  }}
+	  
+	  var HTTPMessage http_response;
+	  if (f_execute_HTTP_querry(hname, hport, http_request, http_response, 4.0)) {
+	       setverdict(pass);
+	       
+	    var template HTTPMessage http_response_template := {response := {
+	      client_id := *,
+	      version_major := 1,
+		  version_minor := 1,
+		  statuscode := 200,
+		  statustext := "OK",
+		  header := ?,
+		  body := ?
+	    }}
+	    
+	    if (match(http_response, http_response_template)) {
+	       
+			log("ELNRNAG HTTPResponse =============")		       
+			log(http_response);
+  			log("ELNRNAG HTTPResponse =============")
+	        setverdict(pass);
+    	    security_token := http_response.response.body;
+	        to_return := true;
+	        executionId := http_response.response.body;
+	    } else {
+	      security_token := "";
+	      to_return := false;
+	    }
+	  }
+	}
+	return to_return;
+}
+
+function f_send_subscription_request_to_exec_manager(in charstring hname, 
+									     			 in integer hport, 
+												     in charstring security_token, 
+												     in charstring executionID) runs on MBT_CT return boolean {
+  	var charstring SubscriptionJSON := "{\"exid\":\" "& executionID & "\"}";
+  
+  	var ConnectionId  connid;
+  	var boolean to_return := false;
+  
+  
+  	if (f_open_connection (HTTPclientPort, hname, hport, 4.0, connid)) {
+    setverdict(pass);
+      //var HeaderLine hl_
+	  var HeaderLines header := getCommonHeaderLines(hname, hport, security_token);
+	  
+	  //var charstring URI := "/login?email="&emailaddr&"&pw="&password;
+	  
+	  var HTTPMessage http_request := { request := {
+	      client_id := omit,
+		  method := "GET",
+		  uri := "/", //May need an URI
+		  version_major := 1,
+		  version_minor := 1,
+		  header := header,
+		  body := SubscriptionJSON
+	  }}
+	  
+	  var HTTPMessage http_response;
+	  if (f_execute_HTTP_querry(hname, hport, http_request, http_response, 4.0)) {
+	       setverdict(pass);
+	       
+	    var template HTTPMessage http_response_template := {response := {
+	      client_id := *,
+	      version_major := 1,
+		  version_minor := 1,
+		  statuscode := 200,
+		  statustext := "OK",
+		  header := ?,
+		  body := ?
+	    }}
+	    
+	    if (match(http_response, http_response_template)) {
+	       
+			log("ELNRNAG HTTPResponse =============")		       
+			log(http_response);
+  			log("ELNRNAG HTTPResponse =============")
+	        setverdict(pass);
+    	    security_token := http_response.response.body;
+	        to_return := true;
+	    } else {
+	      security_token := "";
+	      to_return := false;
+	    }
+	  }
+	}
+	return to_return;
+												       
+												       
+												       
+  return false
+}
+
+function f_download_file_from_repository(in charstring hname, 
+									     in integer hport, 
+									     in charstring security_token, 
+									     in charstring project,
+									     in charstring source,
+									     in charstring filepath,
+									     in charstring filename) runs on MBT_CT return boolean {
+  // /download?project="MBT"&source="user"&filepath="MBT/"&filename="test.jpg"
+    	var ConnectionId  connid;
+  	var boolean to_return := false;
+  
+  
+  	if (f_open_connection (HTTPclientPort, hname, hport, 4.0, connid)) {
+    setverdict(pass);
+      
+	  
+	  var charstring URI := "/download?project=\"" & project & "\"&source=\"" & source & "\"&filepath=\"" & filepath & "\"&filename=\"" & filename & "\"";
+	  
+	  var HeaderLines header := getCommonHeaderLines(hname, hport, security_token);
+	  
+	  var HeaderLine hl_content_type := {header_name := "Content-Type",
+        							      header_value := "multipart/form-data"};
+	  header := header & {hl_content_type};
+	  var HTTPMessage http_request := { request := {
+	      client_id := omit,
+		  method := "GET",
+		  uri := URI,
+		  version_major := 1,
+		  version_minor := 1,
+		  header := header,
+		  body := ""
+	  }}
+	  
+	  var HTTPMessage http_response;
+  	  	  if (f_execute_HTTP_querry(hname, hport, http_request, http_response, 4.0)) {
+	       setverdict(pass);
+	       
+	    var template HTTPMessage http_response_template := {response := {
+	      client_id := *,
+	      version_major := 1,
+		  version_minor := 1,
+		  statuscode := 200,
+		  statustext := "OK",
+		  header := ?,
+		  body := ?
+	    }}
+	    
+	    if (match(http_response, http_response_template)) {
+	       
+			log("ELNRNAG HTTPResponse =============")		       
+			log(http_response);
+  			log("ELNRNAG HTTPResponse =============")
+	        setverdict(pass);
+	        to_return := true;
+	    } else {
+	      to_return := false;
+	    }
+	  }
+	}
+    return to_return;
+}
+
+
+
+function f_download_perf_info_from_exec_manager(
+) runs on MBT_CT return boolean{
+  return false
+}
+
+
+/*********************************
+Subscription notification handler
+*********************************/
+/*
+altstep as_wait_for_notification(in float max_timeout){
+  
+}
+*/
+
+/*
+  Handles the Websocket ping message 
+*/
+
+altstep as_ws_ping_handler(in ConnectionId connid) runs on MBT_CT{
+  var ASP_RecvFrom msg;
+  [] HTTPclientPort.receive(ASP_RecvFrom:{
+       connId:=connid,
+       remName:=?,
+       remPort:=?,
+       locName:=?,
+       locPort:=?,
+       proto:=?,
+       userData:=?,
+       msg:='89*'O
+     }) -> value msg{ // PING frame received
+       var WebSocket_PDU pdu
+       var octetstring data
+       if(f_WebSocket_Decode(msg.msg,pdu)==0){
+         pdu.opcode:=Pong
+         pdu.fin_bit:='1'B
+         pdu.mask_bit:='1'B
+         pdu.masking_key:=omit
+         f_WebSocket_Encode(pdu,data)
+         f_send_msg(HTTPclientPort,connid,data)
+       }
+       repeat
+    }
+}
+
+}
