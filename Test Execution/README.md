@@ -31,6 +31,5 @@ emacs is not installed by default on all systems, on Ubuntu it can be installed 
 Run the test suite using the following command:
 > ttcn3_start ./mbttest ./MyExample.cfg
 
-! For now this will result in fail verdict, as not all the services are complete,
-  and not all test functionalities are ready and tested.
+
 
