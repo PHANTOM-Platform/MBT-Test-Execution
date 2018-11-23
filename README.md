@@ -4,3 +4,7 @@ The objective of Model-based Testing (MBT) in PHANTOM is to carry out black box 
 Concretely, the MBT in PHANTOM are conducted in two phases - early validation and test execution - along with four activities - model validation, performance estimation, functional testing and non-functional testing. Early validation is realized by model validation and performance estimation to check the functionalities of the intended implementations and estimate the performance in parallel with the application development, whilst test execution provides and executes concrete tests to conduct thorough functional and non-functional testing. 
 
 ![alt text](https://github.com/PHANTOM-Platform/Model-based-Testing/blob/master/images/MBT%20Activities.png)
+
+<p align="center">
+  <img / https://github.com/PHANTOM-Platform/Model-based-Testing/blob/master/images/MBT%20Activities.png>
+</p>
