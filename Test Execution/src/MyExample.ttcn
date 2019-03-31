@@ -98,8 +98,8 @@ testcase TC_send() runs on MBT_CT {
   
 //Step 1. Testing system sends a) testing inputs (files), and b) deployment plan (xml file) to Repository;
 
-
-  	var charstring metadata := "{\"project\": \"MBT\",  \"source\": \"user\", \"type\":\"InputImage\", \"name\":\"HPC\",  \"content\":\"img_file\"}";
+	
+  	var charstring metadata := "{\"project\": \""&PAR_PROJECT&"\",  \"source\": \"user\", \"type\":\"InputImage\", \"name\":\"HPC\",  \"content\":\"img_file\"}";
     
     var FileList fileList;
     
@@ -108,16 +108,16 @@ testcase TC_send() runs on MBT_CT {
       
       for (var integer i := 0; i < lengthof(fileList); i:=i+1) {
         if((fileList[i] != "..") and (fileList[i] != ".")){
-          //if ((substr(fileList[i],0,4) == "1_sd") or (fileList[i] == PAR_DEPLOYMENTPLAN)) {
+          if ((substr(fileList[i],0,4) == "1_sd") or (fileList[i] == PAR_DEPLOYMENTPLAN)) {
             log ("Uploading " & fileList[i] &" ...");
-        	  if(f_upload_file_to_repository(PAR_SERVER, PAR_REPOSITORY_PORT, sec_token, PAR_INPUT_DIR, fileList[i], metadata, "MBT")) {
+        	  if(f_upload_file_to_repository(PAR_SERVER, PAR_REPOSITORY_PORT, sec_token, PAR_PROJECT, PAR_INPUT_DIR, fileList[i], metadata, "MBT")) {
         	  	log ("Successfully uploaded " & fileList[i]);
         	    setverdict(pass);
 	       	  } else {
     		    log ("Failed to upload " & fileList[i] & "!");
     		    setverdict(fail);
     	  	  }
-          //}
+          }
       	}
       }
     }
@@ -134,6 +134,8 @@ testcase TC_send() runs on MBT_CT {
     if (f_send_execution_request_to_appl_manager(PAR_SERVER, 
     											 PAR_APPLICATION_MANAGER_PORT, 
     											 sec_token, 
+    											 PAR_PROJECT,
+    											 "MapName",
     											 PAR_EXEC_MAN_USER,
     											 PAR_EXEC_MAN_APPLICATION,
     											 PAR_EXEC_MAN_CONTENT,
@@ -169,10 +171,11 @@ testcase TC_send() runs on MBT_CT {
     {
       setverdict(pass);								  
     } else {
+      log("Failed to download files");
       setverdict(fail);
     }
     
-//Step 7. Testing system generates testing verdicts based on the real outputs and/or performance information.  
+//Step 6. Testing system generates testing verdicts based on the real outputs and/or performance information.  
     
 	
   unmap(self:HTTPclientPort, system:HTTPclientPort);

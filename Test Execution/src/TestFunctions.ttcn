@@ -932,6 +932,7 @@ function f_get_security_token(in charstring hname, in integer hport, in charstri
 function f_upload_file_to_repository(in charstring hname, 
 									 in integer hport, 
 									 in charstring security_token, 
+									 in charstring project,
 									 in charstring input_directory,
 									 in charstring filename, 
 									 in charstring metadata, 
@@ -944,7 +945,7 @@ function f_upload_file_to_repository(in charstring hname,
   	if (f_open_connection (HTTPclientPort, hname, hport, 4.0, connid)) {
     setverdict(pass);
       
-	  var charstring URI := "/upload?DestFileName="&filename&"&Path="&destination_dir&"/";
+	  var charstring URI := "/upload?project="&project&"&source="&input_directory&"&DestFileName="&filename&"&Path="&destination_dir&"/";
 	  
 	  var HeaderLines header := getCommonHeaderLines(hname, hport, security_token);
 	  
@@ -999,14 +1000,24 @@ function f_send_deplyment_plan_to_repository(
 function f_send_execution_request_to_appl_manager(in charstring hname, 
 									 			  in integer hport, 
 									              in charstring security_token,
+									              in charstring project,
+									              in charstring map_name,
 									              in charstring user,
 									              in charstring application,
-									              in charstring content,
+									              in charstring input_file_name,
 									              in charstring modifiedAt,
 									              out charstring executionId)	runs on MBT_CT return boolean{
-  
-  	var charstring ExecutionRequestJSON := "{\"user\":\" "& user &"\",\"application\":\"" & application & "\",\"content\":\"" & content & "\",\"modifiedAt\": \" "& modifiedAt & "\"}";
-  
+    /*
+    https://github.com/PHANTOM-Platform/testing_integration/tree/master/java_requestor_of_execution#example-in-java-of-requesting-the-execution-of-an-app-and-requesting-to-be-notified-of-the-end-of-the-execution
+
+	"project":"ProjectName",
+	"map":"MapName",
+	"requested-by":"mom/mbt/user",
+	"input":"InputFileName"
+    */  
+
+  	var charstring ExecutionRequestJSON := "{\"project\":\" "& project &"\",\"map\":\"" & map_name & "\",\"requested_by\":\"" & user & "\",\"input\": \" "& input_file_name & "\"}";
+
   	var ConnectionId  connid;
   	var boolean to_return := false;
   
@@ -1016,12 +1027,13 @@ function f_send_execution_request_to_appl_manager(in charstring hname,
       //var HeaderLine hl_
 	  var HeaderLines header := getCommonHeaderLines(hname, hport, security_token);
 	  
-	  //var charstring URI := "/login?email="&emailaddr&"&pw="&password;
+	  //var charstring URI := "/register_new_exec";
+	  var charstring URI := "/";
 	  
 	  var HTTPMessage http_request := { request := {
 	      client_id := omit,
-		  method := "GET",
-		  uri := "/", //May need an URI
+		  method := "GET", //"POST",
+		  uri := URI,
 		  version_major := 1,
 		  version_minor := 1,
 		  header := header,
